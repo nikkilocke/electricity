@@ -1,11 +1,14 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using CodeFirstWebFramework;
 using Markdig.Syntax.Inlines;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Org.BouncyCastle.Asn1.Cms;
+using Org.BouncyCastle.Asn1.Pkcs;
 using static System.Net.Mime.MediaTypeNames;
 
 namespace Electricity {
@@ -27,7 +30,7 @@ namespace Electricity {
         }
 
         public DataTableForm List() {
-            return new DataTableForm(this, typeof(DataDisplay), false, "Name", "OffPeakRate", "PeakRate", "StandingCharge", "ShiftWeeklyUnitsToOffPeak", "PercentageOffPeak", "TotalCost", "AnnualCost", "MonthlyCost") {
+            return new DataTableForm(this, typeof(DataDisplay), false, "Name", "Rate", "StandingCharge", "TotalCost", "AnnualCost", "MonthlyCost") {
                 Select = "/home/view"
             };
         }
@@ -36,68 +39,99 @@ namespace Electricity {
             return Database.Query("SELECT * FROM DataDisplay ORDER BY Name");
         }
 
-        public Form View(int id) {
+        public HeaderDetailForm View(int id) {
             if(id > 0)
                 InsertMenuOptions(new MenuOption("Copy", "/home/view?dup=y&id=" + id));
             if (id <= 0 || !Database.TryGet(id, out DataDisplay display)) {
                 display = new DataDisplay() {
-                    OffPeakStart = ((Settings)Settings).OffPeakStart,
-                    OffPeakEnd = ((Settings)Settings).OffPeakEnd,
-                    OffPeakRate = ((Settings)Settings).OffPeakRate,
-                    PeakRate = ((Settings)Settings).PeakRate,
+                    Rate = ((Settings)Settings).PeakRate,
                     StandingCharge = ((Settings)Settings).StandingCharge,
                     PeriodStart = DateTime.Today.AddYears(-1),
                     PeriodEnd = DateTime.Today
                 };
+                if(display.Rate != ((Settings)Settings).OffPeakRate)
+                    display.Rates = new List<RatePeriod>(new RatePeriod[] {
+                        new RatePeriod() {
+                            Start = ((Settings)Settings).OffPeakStart,
+                            End = ((Settings)Settings).OffPeakEnd,
+                            Rate = ((Settings)Settings).OffPeakRate
+                        }
+                    });
             }
             if (GetParameters["dup"] == "y") {
                 display.idDataDisplay = null;
                 display.Name += " (copy)";
             }
-            Form form = new Form(this, typeof(DataDisplay)) {
-                Data = display
+            HeaderDetailForm form = new HeaderDetailForm(this, typeof(DataDisplay), typeof(RatePeriod)) {
+                Data = new JObject().AddRange("header", display, "detail", display.Rates)
             };
+            form.Detail.Options["addRows"] = true;
+            form.Detail.Options["deleteRows"] = true;
             return form;
         }
 
-        public AjaxReturn ViewSave(DataDisplay json) {
-            json.OffPeakUsage = json.PeakUsage = 0;
+        public AjaxReturn ViewSave(JObject json) {
+            DataDisplay header = json["header"].To<DataDisplay>();
+            List<RatePeriod> rates = new List<RatePeriod>(json["detail"].To<List<RatePeriod>>()
+                .Where(rp => rp.Start != rp.End && rp.Rate != 0));
+            // Remove empty rates
+            header.PeakUsage = 0;
             DateTime first = DateTime.MaxValue;
             DateTime last = DateTime.MinValue;
+            foreach (RatePeriod rate in rates) {
+                rate.Units = 0;
+                rate.Cost = 0;
+            }
             foreach(Data d in Database.Query<Data>($@"SELECT *
 FROM Data
-WHERE Period >= {Database.Quote(json.PeriodStart)}
-AND Period < {Database.Quote(json.PeriodEnd)}
+WHERE Period >= {Database.Quote(header.PeriodStart)}
+AND Period < {Database.Quote(header.PeriodEnd)}
 ")) {
-                if (d.InPeakTime(json.OffPeakStart, json.OffPeakEnd))
-                    json.PeakUsage += d.Value;
-                else
-                    json.OffPeakUsage += d.Value;
+                decimal time = d.Period.Hour + d.Period.Minute / 100;
+                d.RateIndex = -1;
+                for(int i = 0; i < rates.Count; i++) {
+                    RatePeriod rate = rates[i];
+                    if (rate.Matches(time)) {
+                        d.RateIndex = i;
+                        rate.Units += d.Value;
+                        break;
+                    }
+                }
+                if (d.RateIndex == -1)
+                    header.PeakUsage += d.Value;
                 if (d.Period < first)
                     first = d.Period.Date;
                 if (d.Period > last)
-                    last = d.Period.Date;
+                    last = d.Period.Date.AddDays(1);
             }
             if(last != DateTime.MaxValue) {
-                json.PeriodStart = first;
-                json.PeriodEnd = last;
+                header.PeriodStart = first;
+                header.PeriodEnd = last;
             }
-            json.Days = (int)(json.PeriodEnd - json.PeriodStart).TotalDays;
-            decimal shift = json.ShiftWeeklyUnitsToOffPeak * json.Days / 7m;
-            json.PeakUsage -= shift;
-            json.OffPeakUsage += shift;
-            json.TotalUsage = json.OffPeakUsage + json.PeakUsage;
-            json.PercentageOffPeak = json.TotalUsage > 0 ? (decimal)json.OffPeakUsage / (decimal)json.TotalUsage : 0;
-            json.PeakCost = json.PeakUsage * json.PeakRate / 100;
-            json.OffPeakCost = json.OffPeakUsage * json.OffPeakRate / 100;
-            json.StandingCost = json.Days * json.StandingCharge / 100;
-            json.TotalCost = json.OffPeakCost + json.PeakCost + json.StandingCost;
-            json.AnnualUsage = json.TotalUsage * 365 / json.Days;
-            json.AnnualCost = json.TotalCost * 365 / json.Days;
-            json.MonthlyCost = Math.Round(json.AnnualCost / 12, 2);
-            AjaxReturn r = SaveRecord(json);
+            header.Days = (int)(header.PeriodEnd - header.PeriodStart).TotalDays;
+            header.StandingCost = header.Days * header.StandingCharge / 100;
+            header.TotalUsage = header.PeakUsage;
+            header.TotalCost = header.StandingCost;
+            foreach (RatePeriod rate in rates) {
+                header.TotalUsage += rate.Units;
+                decimal shift = Math.Round(rate.ShiftWeeklyUnitsHere * header.Days / 7m, 0);
+                header.PeakUsage -= shift;
+                rate.Units += shift;
+                rate.Cost = rate.Units * rate.Rate / 100;
+                header.TotalCost += rate.Cost;
+            }
+            foreach (RatePeriod rate in rates) {
+                rate.Percentage = header.TotalUsage > 0 ? (decimal)rate.Units / (decimal)header.TotalUsage : 0;
+            }
+            header.PeakCost = header.PeakUsage * header.Rate / 100;
+            header.TotalCost += header.PeakCost;
+            header.AnnualUsage = header.TotalUsage * 365 / header.Days;
+            header.AnnualCost = header.TotalCost * 365 / header.Days;
+            header.MonthlyCost = Math.Round(header.AnnualCost / 12, 2);
+            header.Rates = rates;
+            AjaxReturn r = SaveRecord(header);
             if(r.error == null)
-                r.redirect = "/home/view?id=" + json.idDataDisplay;
+                r.redirect = "/home/view?id=" + header.idDataDisplay;
             return r;
         }
 
@@ -160,14 +194,26 @@ AND Period < {Database.Quote(json.PeriodEnd)}
         public int? idDataDisplay;
         [Unique("Name")]
         public string Name;
-        public decimal OffPeakStart;
-        public decimal OffPeakEnd;
-        public decimal OffPeakRate;
-        public decimal PeakRate;
+        public decimal Rate;
         public decimal StandingCharge;
         public DateTime PeriodStart;
         public DateTime PeriodEnd;
-        public int ShiftWeeklyUnitsToOffPeak;
+        [Field(Visible = false)]
+        [Length(0)]
+        public string RateData;
+        [DoNotStore]
+        [JsonIgnore]
+        public List<RatePeriod> Rates {
+            get {
+                if (string.IsNullOrWhiteSpace(RateData))
+                    return new List<RatePeriod>();
+                else
+                    return JArray.Parse(RateData).To<List<RatePeriod>>();
+            }
+            set {
+                RateData = value.ToJToken().ToString();
+            }
+        }
         [ReadOnly]
         public int Days;
         [ReadOnly]
@@ -175,15 +221,9 @@ AND Period < {Database.Quote(json.PeriodEnd)}
         [ReadOnly]
         public decimal PeakUsage;
         [ReadOnly]
-        public decimal OffPeakUsage;
-        [ReadOnly]
-        public decimal PercentageOffPeak;
-        [ReadOnly]
         public decimal AnnualUsage;
         [ReadOnly]
         public decimal PeakCost;
-        [ReadOnly]
-        public decimal OffPeakCost;
         [ReadOnly]
         public decimal StandingCost;
         [ReadOnly]
@@ -199,9 +239,24 @@ AND Period < {Database.Quote(json.PeriodEnd)}
         [Primary(AutoIncrement = false)]
         public DateTime Period;
         public decimal Value;
-        public bool InPeakTime(decimal start, decimal end) {
-            decimal time = Period.Hour + Period.Minute / 100;
-            return start < end ? time < start || time > end : time <= start && time >= end;
+        [DoNotStore]
+        public int RateIndex;
+    }
+
+    public class RatePeriod : JsonObject {
+        [Writeable]
+        public decimal Start;
+        [Writeable]
+        public decimal End;
+        [Writeable]
+        public decimal Rate;
+        [Writeable]
+        public int ShiftWeeklyUnitsHere;
+        public decimal Units;
+        public decimal Cost;
+        public decimal Percentage;
+        public bool Matches(decimal time) {
+            return Start < End ? time > Start && time <= End : Start > End  ? time > End || time <= Start : false;
         }
     }
 
