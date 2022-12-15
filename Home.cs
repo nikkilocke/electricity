@@ -103,20 +103,35 @@ namespace Electricity {
         }
 
         public void ImportSave(UploadedFile UploadData) {
+            // TODO: check if times are UTC or local, and adjust accordingly
             new BatchJob(this, "/", delegate () {
                 Database.BeginTransaction();
-                int lineno = 0;
-                foreach(string line in UploadData.Content.Split('\n')) {
-                    if (lineno++ == 0 || string.IsNullOrWhiteSpace(line))
+                int time = -1, units = -1;
+                string[] data = UploadData.Content.Split('\n');
+                Batch.Records = data.Length;
+                foreach (string line in data) {
+                    Batch.Record++;
+                    if (string.IsNullOrWhiteSpace(line))
                         continue;
-                    string []vals = line.Split(',');
-                    Utils.Check(vals.Length == 2, $"{lineno}:No comma:'$line'");
-                    Data data = new Data() {
-                        Period = DateTime.Parse(vals[0].Replace("\"", "")),
-                        Value = Decimal.Parse(vals[1].Replace("\"", ""))
+                    string[] vals = line.Split(',');
+                    Utils.Check(vals.Length >= 2, $"{Batch.Record}:No comma:'$line'");
+                    if (units == -1) {
+                        // header row
+                        for (int i = 0; i < vals.Length; i++) {
+                            if (vals[i].Contains("Consumption"))
+                                units = i;
+                            else if (vals[i].Contains("time") || vals[i].Contains("End"))
+                                time = i;
+                        }
+                        Utils.Check(time >= 0, $"{Batch.Record}:Time of reading heading not found:'$line'");
+                        Utils.Check(time >= 0 && units >= 0, $"{Batch.Record}:Consumption heading not found:'$line'");
+                        continue;
+                    }
+                    Data d = new Data() {
+                        Period = DateTime.Parse(vals[time].Replace("\"", "")),
+                        Value = Convert.ToDecimal(Double.Parse(vals[units].Replace("\"", "")))
                     };
-                    System.Diagnostics.Debug.WriteLine(data.ToString());
-                    Database.Update(data);
+                    Database.Update(d);
                 }
                 Database.Commit();
             });

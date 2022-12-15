@@ -44,6 +44,8 @@ This gives you a zip file containing your data - extract the csv file (mine is i
 
 Be aware that it is best to import about 1 month's data at a time, as the import seems to struggle with very large files.
 
+The program will also cope with data downloaded from Octopus Energy. If you have data in other formats that doesn't import, please raise an issue on github, and include the headings and a short selection of data from the import file.
+
 ## Adding tariff Scenarios
 
 - Click New Scenario
