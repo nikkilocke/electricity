@@ -30,13 +30,14 @@ namespace Electricity {
         }
 
         public DataTableForm List() {
+            InsertMenuOptions(new MenuOption("Recalculate All", "/home/recalc"));
             return new DataTableForm(this, typeof(DataDisplay), false, "Name", "Rate", "StandingCharge", "TotalCost", "AnnualCost", "MonthlyCost") {
                 Select = "/home/view"
             };
         }
 
         public JObjectEnumerable ListListing() {
-            return Database.Query("SELECT * FROM DataDisplay ORDER BY Name");
+            return Database.Query("SELECT * FROM DataDisplay ORDER BY AnnualCost, Name");
         }
 
         public HeaderDetailForm View(int id) {
@@ -72,67 +73,26 @@ namespace Electricity {
 
         public AjaxReturn ViewSave(JObject json) {
             DataDisplay header = json["header"].To<DataDisplay>();
-            List<RatePeriod> rates = new List<RatePeriod>(json["detail"].To<List<RatePeriod>>()
+            header.Rates = new List<RatePeriod>(json["detail"].To<List<RatePeriod>>()
                 .Where(rp => rp.Start != rp.End && rp.Rate != 0));
-            // Remove empty rates
-            header.PeakUsage = 0;
-            DateTime first = DateTime.MaxValue;
-            DateTime last = DateTime.MinValue;
-            foreach (RatePeriod rate in rates) {
-                rate.Units = 0;
-                rate.Cost = 0;
-            }
-            foreach(Data d in Database.Query<Data>($@"SELECT *
-FROM Data
-WHERE Period >= {Database.Quote(header.PeriodStart)}
-AND Period < {Database.Quote(header.PeriodEnd)}
-")) {
-                decimal time = d.Period.Hour + d.Period.Minute / 100;
-                d.RateIndex = -1;
-                for(int i = 0; i < rates.Count; i++) {
-                    RatePeriod rate = rates[i];
-                    if (rate.Matches(time)) {
-                        d.RateIndex = i;
-                        rate.Units += d.Value;
-                        break;
-                    }
-                }
-                if (d.RateIndex == -1)
-                    header.PeakUsage += d.Value;
-                if (d.Period < first)
-                    first = d.Period.Date;
-                if (d.Period > last)
-                    last = d.Period.Date.AddDays(1);
-            }
-            if(last != DateTime.MaxValue) {
-                header.PeriodStart = first;
-                header.PeriodEnd = last;
-            }
-            header.Days = (int)(header.PeriodEnd - header.PeriodStart).TotalDays;
-            header.StandingCost = header.Days * header.StandingCharge / 100;
-            header.TotalUsage = header.PeakUsage;
-            header.TotalCost = header.StandingCost;
-            foreach (RatePeriod rate in rates) {
-                header.TotalUsage += rate.Units;
-                decimal shift = Math.Round(rate.ShiftWeeklyUnitsHere * header.Days / 7m, 0);
-                header.PeakUsage -= shift;
-                rate.Units += shift;
-                rate.Cost = rate.Units * rate.Rate / 100;
-                header.TotalCost += rate.Cost;
-            }
-            foreach (RatePeriod rate in rates) {
-                rate.Percentage = header.TotalUsage > 0 ? (decimal)rate.Units / (decimal)header.TotalUsage : 0;
-            }
-            header.PeakCost = header.PeakUsage * header.Rate / 100;
-            header.TotalCost += header.PeakCost;
-            header.AnnualUsage = header.TotalUsage * 365 / header.Days;
-            header.AnnualCost = header.TotalCost * 365 / header.Days;
-            header.MonthlyCost = Math.Round(header.AnnualCost / 12, 2);
-            header.Rates = rates;
+            header.Recalc(Database);
             AjaxReturn r = SaveRecord(header);
             if(r.error == null)
                 r.redirect = "/home/view?id=" + header.idDataDisplay;
             return r;
+        }
+
+        public void Recalc() {
+            new BatchJob(this, "/home/list", delegate () {
+                List<DataDisplay> data = Database.Query<DataDisplay>("SELECT * FROM DataDisplay").ToList();
+                Batch.Records = data.Count;
+                foreach (DataDisplay d in data) {
+                    Batch.Status = d.Name;
+                    d.Recalc(Database);
+                    Batch.Record++;
+                    SaveRecord(d);
+                }
+            });
         }
 
         public DumbForm Import() {
@@ -232,6 +192,64 @@ AND Period < {Database.Quote(header.PeriodEnd)}
         public decimal AnnualCost;
         [ReadOnly]
         public decimal MonthlyCost;
+
+        public void Recalc(Database db) {
+            List<RatePeriod> rates = Rates;
+            PeakUsage = 0;
+            DateTime first = DateTime.MaxValue;
+            DateTime last = DateTime.MinValue;
+            foreach (RatePeriod rate in rates) {
+                rate.Units = 0;
+                rate.Cost = 0;
+            }
+            foreach (Data d in db.Query<Data>($@"SELECT *
+FROM Data
+WHERE Period >= {db.Quote(PeriodStart)}
+AND Period < {db.Quote(PeriodEnd)}
+")) {
+                decimal time = d.Period.Hour + d.Period.Minute / 100;
+                d.RateIndex = -1;
+                for (int i = 0; i < rates.Count; i++) {
+                    RatePeriod rate = rates[i];
+                    if (rate.Matches(time)) {
+                        d.RateIndex = i;
+                        rate.Units += d.Value;
+                        break;
+                    }
+                }
+                if (d.RateIndex == -1)
+                    PeakUsage += d.Value;
+                if (d.Period < first)
+                    first = d.Period.Date;
+                if (d.Period > last)
+                    last = d.Period.Date.AddDays(1);
+            }
+            if (last != DateTime.MaxValue) {
+                PeriodStart = first;
+                PeriodEnd = last;
+            }
+            Days = (int)(PeriodEnd - PeriodStart).TotalDays;
+            StandingCost = Days * StandingCharge / 100;
+            TotalUsage = PeakUsage;
+            TotalCost = StandingCost;
+            foreach (RatePeriod rate in rates) {
+                TotalUsage += rate.Units;
+                decimal shift = Math.Round(rate.ShiftWeeklyUnitsHere * Days / 7m, 0);
+                PeakUsage -= shift;
+                rate.Units += shift;
+                rate.Cost = rate.Units * rate.Rate / 100;
+                TotalCost += rate.Cost;
+            }
+            foreach (RatePeriod rate in rates) {
+                rate.Percentage = TotalUsage > 0 ? (decimal)rate.Units / (decimal)TotalUsage : 0;
+            }
+            PeakCost = PeakUsage * Rate / 100;
+            TotalCost += PeakCost;
+            AnnualUsage = TotalUsage * 365 / Days;
+            AnnualCost = TotalCost * 365 / Days;
+            MonthlyCost = Math.Round(AnnualCost / 12, 2);
+            Rates = rates;
+        }
     }
 
     [Table]
