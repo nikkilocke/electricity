@@ -9,7 +9,16 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Org.BouncyCastle.Asn1.Cms;
 using Org.BouncyCastle.Asn1.Pkcs;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Net;
+using System.Net.Sockets;
+using System.IO;
+using System.Threading;
 using static System.Net.Mime.MediaTypeNames;
+using Newtonsoft.Json.Serialization;
+using MySqlX.XDevAPI.Common;
+using System.Threading.Tasks;
 
 namespace Electricity {
     public class Home : AppModule {
@@ -19,6 +28,7 @@ namespace Electricity {
             InsertMenuOptions(
                 new MenuOption("List Scenarios", "/home/list"),
                 new MenuOption("New Scenario", "/home/view?id=0"),
+                new MenuOption("Download From Hildebrand", "/home/downloadfromhildebrand"),
                 new MenuOption("Import", "/home/import"),
                 new MenuOption("Check For Missing Data", "/home/check"),
                 new MenuOption("Settings", "/admin/editsettings")
@@ -41,7 +51,7 @@ namespace Electricity {
         }
 
         public HeaderDetailForm View(int id) {
-            if(id > 0)
+            if (id > 0)
                 InsertMenuOptions(new MenuOption("Copy", "/home/view?dup=y&id=" + id));
             if (id <= 0 || !Database.TryGet(id, out DataDisplay display)) {
                 display = new DataDisplay() {
@@ -50,7 +60,7 @@ namespace Electricity {
                     PeriodStart = DateTime.Today.AddYears(-1),
                     PeriodEnd = DateTime.Today
                 };
-                if(display.Rate != ((Settings)Settings).OffPeakRate)
+                if (display.Rate != ((Settings)Settings).OffPeakRate)
                     display.Rates = new List<RatePeriod>(new RatePeriod[] {
                         new RatePeriod() {
                             Start = ((Settings)Settings).OffPeakStart,
@@ -77,22 +87,34 @@ namespace Electricity {
                 .Where(rp => rp.Start != rp.End && rp.Rate != 0));
             header.Recalc(Database);
             AjaxReturn r = SaveRecord(header);
-            if(r.error == null)
+            if (r.error == null)
                 r.redirect = "/home/view?id=" + header.idDataDisplay;
             return r;
         }
 
-        public void Recalc() {
+        public Form Recalc() {
+            return new Form(this, typeof(DataDisplay), true, "PeriodStart", "PeriodEnd") {
+                Data = new DataDisplay() {
+                    PeriodStart = DateTime.Today.AddYears(-1),
+                    PeriodEnd = DateTime.Today
+                }
+            };
+        }
+
+        public AjaxReturn RecalcSave(DataDisplay json) {
             new BatchJob(this, "/home/list", delegate () {
                 List<DataDisplay> data = Database.Query<DataDisplay>("SELECT * FROM DataDisplay").ToList();
                 Batch.Records = data.Count;
                 foreach (DataDisplay d in data) {
                     Batch.Status = d.Name;
+                    d.PeriodStart = json.PeriodStart;
+                    d.PeriodEnd = json.PeriodEnd;
                     d.Recalc(Database);
                     Batch.Record++;
                     SaveRecord(d);
                 }
             });
+            return new AjaxReturn() { redirect = "/admin/batch?id=" + Batch.Id };
         }
 
         public DumbForm Import() {
@@ -104,7 +126,7 @@ namespace Electricity {
 
         public void ImportSave(UploadedFile UploadData) {
             // TODO: check if times are UTC or local, and adjust accordingly
-            new BatchJob(this, "/", delegate () {
+            new BatchJob(this, "/home/list", delegate () {
                 Database.BeginTransaction();
                 int time = -1, units = -1;
                 string[] data = UploadData.Content.Split('\n');
@@ -148,7 +170,7 @@ namespace Electricity {
             List<CheckResult> results = new List<CheckResult>();
             CheckResult current = null;
             foreach (Data d in Database.Query<Data>($@"SELECT * FROM Data ORDER BY Period")) {
-                if(current == null || d.Period > current.End.AddMinutes(30)) {
+                if (current == null || d.Period > current.End.AddMinutes(30)) {
                     current = new CheckResult() { Start = d.Period, End = d.Period };
                     results.Add(current);
                 } else {
@@ -160,7 +182,76 @@ namespace Electricity {
             return form;
         }
 
+        public Form DownloadFromHildebrand() {
+            return new Form(this, typeof(DownloadRequest)) {
+                Data = new DownloadRequest() {
+                    Start = DateTime.Now.AddDays(-10),
+                    End = DateTime.Now,
+                    HildebrandLogin = ((Settings)Settings).HildebrandLogin,
+                    HildebrandPassword = ((Settings)Settings).HildebrandPassword
+                }
+};
+        }
 
+        HttpClient client;
+        static DateTime epoch = new DateTime(1970, 1, 1, 0, 0, 0, 0, DateTimeKind.Utc);
+
+        public AjaxReturn DownloadFromHildebrandSave(DownloadRequest json) {
+            ((Settings)Settings).HildebrandLogin = json.HildebrandLogin;
+            ((Settings)Settings).HildebrandPassword = json.HildebrandPassword;
+            Database.Update(Settings);
+            new AsyncBatchJob(this, "/home/list", async delegate () {
+                using (client = new HttpClient()) {
+                    Batch.Status = "Logging in";
+                    client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+                    JObject headers = new JObject().AddRange(
+//                        "Content-Type", "application/json",
+                        "applicationId", "b0f1b774-a586-4f72-9edd-27ead8aa7a8d"
+                        );
+                    // Login
+                    JObject j = (JObject) await send(HttpMethod.Post, "https://api.glowmarkt.com/api/v0-1/auth",
+                        headers, new JObject().AddRange(
+                            "username", json.HildebrandLogin,
+                            "password", json.HildebrandPassword
+                            ));
+                    Batch.Status = "Getting entities";
+                    headers["token"] = j["token"];
+                    JArray entities = (JArray)await send(HttpMethod.Get, "https://api.glowmarkt.com/api/v0-1/virtualentity", headers, null);
+                    JObject resource = (JObject)((JArray)entities[0]["resources"]).First(r => r["name"].ToString().Contains("consumption"));
+                    Batch.Status = "Getting data";
+                    j = (JObject)await send(HttpMethod.Get, $"https://api.glowmarkt.com/api/v0-1/resource/{resource["resourceId"]}/readings?from={json.Start:s}&to={json.End:s}&period=PT30M&function=sum", headers, null);
+                    JArray data = (JArray)j["data"];
+                    Database.BeginTransaction();
+                    Batch.Records = data.Count;
+                    foreach (JArray line in data) {
+                        Batch.Record++;
+                        Data d = new Data() {
+                            Period = epoch.AddSeconds(line[0].ToObject<int>()),
+                            Value = line[1].ToObject<decimal>()
+                        };
+                        Database.Update(d);
+                    }
+                    Database.Commit();
+                }
+            });
+            return new AjaxReturn() { redirect = "/admin/batch?id=" + Batch.Id };
+        }
+
+        async Task<JToken> send(HttpMethod method, string uri, JObject headers, JObject postParameters) {
+            using (var message = new HttpRequestMessage(method, uri)) {
+                foreach (KeyValuePair<string, JToken> h in headers)
+                    message.Headers.Add(h.Key, h.Value.ToString());
+                message.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+                message.Headers.Add("User-Agent", "Electricity");
+                if (postParameters != null)
+                    message.Content = new StringContent(postParameters.ToJson(), System.Text.Encoding.UTF8, "application/json");
+                using (HttpResponseMessage result = await client.SendAsync(message)) {
+                    string data = await result.Content.ReadAsStringAsync();
+                    result.EnsureSuccessStatusCode();
+                    return JToken.Parse(data);
+                }
+            }
+        }
     }
 
     [Table]
@@ -195,6 +286,8 @@ namespace Electricity {
         public decimal TotalUsage;
         [ReadOnly]
         public decimal PeakUsage;
+        [ReadOnly]
+        public decimal PeakPercentage;
         [ReadOnly]
         public decimal AnnualUsage;
         [ReadOnly]
@@ -259,12 +352,22 @@ AND Period < {db.Quote(PeriodEnd)}
                 rate.Percentage = TotalUsage > 0 ? (decimal)rate.Units / (decimal)TotalUsage : 0;
             }
             PeakCost = PeakUsage * Rate / 100;
+            PeakPercentage = TotalUsage > 0 ? (decimal)PeakUsage / (decimal)TotalUsage : 0;
             TotalCost += PeakCost;
             AnnualUsage = TotalUsage * 365 / Days;
             AnnualCost = TotalCost * 365 / Days;
             MonthlyCost = Math.Round(AnnualCost / 12, 2);
             Rates = rates;
         }
+
+    }
+
+    [Writeable]
+    public class DownloadRequest : JsonObject {
+        public DateTime Start;
+        public DateTime End;
+        public string HildebrandLogin;
+        public string HildebrandPassword;
     }
 
     [Table]
@@ -300,5 +403,7 @@ AND Period < {db.Quote(PeriodEnd)}
         public decimal OffPeakRate;
         public decimal PeakRate;
         public decimal StandingCharge;
+        public string HildebrandLogin;
+        public string HildebrandPassword;
     }
 }
