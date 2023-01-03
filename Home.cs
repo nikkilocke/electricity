@@ -177,7 +177,7 @@ namespace Electricity {
                     current.End = d.Period;
                 }
             }
-            ListForm form = new ListForm(this, typeof(CheckResult));
+            ListForm form = new ListForm(this, typeof(CheckResult), false);
             form.Data = results;
             return form;
         }
