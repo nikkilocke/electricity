@@ -7,6 +7,8 @@ using Newtonsoft.Json.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Threading.Tasks;
+using System.Text;
+using System.Globalization;
 
 namespace Electricity {
     public class Home : AppModule {
@@ -16,7 +18,8 @@ namespace Electricity {
             InsertMenuOptions(
                 new MenuOption("List Scenarios", "/home/list"),
                 new MenuOption("New Scenario", "/home/view?id=0"),
-                new MenuOption("Download From Hildebrand", "/home/downloadfromhildebrand"),
+				new MenuOption("Download From Octopus", "/home/downloadfromoctopus"),
+				new MenuOption("Download From Hildebrand", "/home/downloadfromhildebrand"),
                 new MenuOption("Import", "/home/import"),
                 new MenuOption("Check For Missing Data", "/home/check"),
                 new MenuOption("Settings", "/admin/editsettings")
@@ -178,7 +181,7 @@ namespace Electricity {
                     HildebrandLogin = ((Settings)Settings).HildebrandLogin,
                     HildebrandPassword = ((Settings)Settings).HildebrandPassword
                 }
-};
+            };
         }
 
         HttpClient client;
@@ -225,7 +228,63 @@ namespace Electricity {
             return new AjaxReturn() { redirect = "/admin/batch?id=" + Batch.Id };
         }
 
-        async Task<JToken> send(HttpMethod method, string uri, JObject headers, JObject postParameters) {
+		public Form DownloadFromOctopus() {
+			return new Form(this, typeof(OctopusDownloadRequest)) {
+				Data = new OctopusDownloadRequest() {
+					Start = DateTime.Now.AddDays(-10),
+					End = DateTime.Now,
+					OctopusAccountNumber = ((Settings)Settings).OctopusAccountNumber,
+					OctopusApiKey = ((Settings)Settings).OctopusApiKey,
+                    MeterMpan = ((Settings)Settings).MeterMpan,
+                    MeterSerialNumber = ((Settings)Settings).MeterSerialNumber
+				}
+			};
+		}
+
+        string octopusDate(DateTime d) {
+            return d.ToUniversalTime().ToString("yyyy-MM-ddThh:mm:ssZ");
+        }
+
+		public AjaxReturn DownloadFromOctopusSave(OctopusDownloadRequest json) {
+			((Settings)Settings).OctopusAccountNumber = json.OctopusAccountNumber;
+			((Settings)Settings).OctopusApiKey = json.OctopusApiKey;
+			((Settings)Settings).MeterMpan = json.MeterMpan;
+			((Settings)Settings).MeterSerialNumber = json.MeterSerialNumber;
+			Database.Update(Settings);
+			new AsyncBatchJob(this, "/home/list", async delegate () {
+				using (client = new HttpClient()) {
+					Batch.Status = "Downloading data";
+					client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+					JObject headers = new JObject().AddRange(
+						"Authorization", "Basic " + Convert.ToBase64String(Encoding.GetBytes(json.OctopusApiKey + ":"))
+						);
+                    // Login
+                    JObject j = (JObject)await send(HttpMethod.Get,
+$"https://api.octopus.energy/v1/electricity-meter-points/{json.MeterMpan}/meters/{json.MeterSerialNumber}/consumption/"
++ "?order_by=period"
++ "&page_size=25000&"
++ "period_from=" + octopusDate(json.Start)
++ "&period_to=" + octopusDate(json.End),
+                        headers, null);
+                    JArray data = (JArray)j["results"];
+					Batch.Status = "Analysing results";
+					Database.BeginTransaction();
+					Batch.Records = data.Count;
+					foreach (JObject line in data) {
+						Batch.Record++;
+                        Data d = new Data() {
+                            Period = line.AsDate("interval_start"),
+                            Value = line.AsDecimal("consumption")
+						};
+						Database.Update(d);
+					}
+					Database.Commit();
+				}
+			});
+			return new AjaxReturn() { redirect = "/admin/batch?id=" + Batch.Id };
+		}
+
+		async Task<JToken> send(HttpMethod method, string uri, JObject headers, JObject postParameters) {
             using (var message = new HttpRequestMessage(method, uri)) {
                 foreach (KeyValuePair<string, JToken> h in headers)
                     message.Headers.Add(h.Key, h.Value.ToString());
@@ -358,7 +417,17 @@ AND Period < {db.Quote(PeriodEnd)}
         public string HildebrandPassword;
     }
 
-    [Table]
+	[Writeable]
+	public class OctopusDownloadRequest : JsonObject {
+		public DateTime Start;
+		public DateTime End;
+		public string OctopusAccountNumber;
+		public string OctopusApiKey;
+		public string MeterMpan;
+		public string MeterSerialNumber;
+	}
+
+	[Table]
     public class Data : JsonObject {
         [Primary(AutoIncrement = false)]
         public DateTime Period;
@@ -393,5 +462,9 @@ AND Period < {db.Quote(PeriodEnd)}
         public decimal StandingCharge;
         public string HildebrandLogin;
         public string HildebrandPassword;
+        public string OctopusAccountNumber;
+        public string OctopusApiKey;
+        public string MeterMpan;
+        public string MeterSerialNumber;
     }
 }
