@@ -56,7 +56,8 @@ namespace Electricity {
                         new RatePeriod() {
                             Start = ((Settings)Settings).OffPeakStart,
                             End = ((Settings)Settings).OffPeakEnd,
-                            Rate = ((Settings)Settings).OffPeakRate
+                            Rate = ((Settings)Settings).OffPeakRate,
+                            Battery = BatteryUse.Charge
                         }
                     });
             }
@@ -67,13 +68,19 @@ namespace Electricity {
             HeaderDetailForm form = new HeaderDetailForm(this, typeof(DataDisplay), typeof(RatePeriod)) {
                 Data = new JObject().AddRange("header", display, "detail", display.Rates)
             };
-            form.Detail.Options["addRows"] = true;
+            form.CanDelete = display.idDataDisplay != null;
+			form.Detail.Options["addRows"] = true;
             form.Detail.Options["deleteRows"] = true;
             return form;
         }
 
         public AjaxReturn ViewSave(JObject json) {
             DataDisplay header = json["header"].To<DataDisplay>();
+            if(header.BatteryStorage > 0) {
+                Utils.Check(header.MaxChargeRate > 0, "Max Charge Rate must be > 0");
+				Utils.Check(header.MaxDischargeRate > 0, "Max Discharge Rate must be > 0");
+				Utils.Check(header.Efficiency > 0 && header.Efficiency <= 100, "Efficience must be > 0 and <= 100%");
+            }
             header.Rates = new List<RatePeriod>(json["detail"].To<List<RatePeriod>>()
                 .Where(rp => rp.Start != rp.End && rp.Rate != 0));
             header.Recalc(Database);
@@ -81,6 +88,10 @@ namespace Electricity {
             if (r.error == null)
                 r.redirect = "/home/view?id=" + header.idDataDisplay;
             return r;
+        }
+
+        public AjaxReturn ViewDelete(int id) {
+            return DeleteRecord("DataDisplay", id);
         }
 
         public Form Recalc() {
@@ -311,6 +322,15 @@ $"https://api.octopus.energy/v1/electricity-meter-points/{json.MeterMpan}/meters
         public decimal StandingCharge;
         public DateTime PeriodStart;
         public DateTime PeriodEnd;
+        [Field(Postamble = "kWh")]
+        public decimal BatteryStorage;
+        [Field(Postamble = "kW")]
+        public decimal MaxChargeRate;
+		[Field(Postamble = "kW")]
+		public decimal MaxDischargeRate;
+		[Field(Postamble = "%")]
+		public decimal Efficiency;
+        public BatteryUse MainRateBattery = BatteryUse.Use;
         [Field(Visible = false)]
         [Length(0)]
         public string RateData;
@@ -332,13 +352,17 @@ $"https://api.octopus.energy/v1/electricity-meter-points/{json.MeterMpan}/meters
         [ReadOnly]
         public decimal TotalUsage;
         [ReadOnly]
-        public decimal PeakUsage;
+        public decimal MainRateUsage;
         [ReadOnly]
-        public decimal PeakPercentage;
-        [ReadOnly]
+        public decimal MainRatePercentage;
+		[ReadOnly]
+		public decimal MainRateBatteryChargedUnits;
+		[ReadOnly]
+		public decimal MainRateBatteryUsedUnits;
+		[ReadOnly]
         public decimal AnnualUsage;
         [ReadOnly]
-        public decimal PeakCost;
+        public decimal MainRateCost;
         [ReadOnly]
         public decimal StandingCost;
         [ReadOnly]
@@ -350,30 +374,34 @@ $"https://api.octopus.energy/v1/electricity-meter-points/{json.MeterMpan}/meters
 
         public void Recalc(Database db) {
             List<RatePeriod> rates = Rates;
-            PeakUsage = 0;
+            MainRateUsage = 0;
             DateTime first = DateTime.MaxValue;
             DateTime last = DateTime.MinValue;
             foreach (RatePeriod rate in rates) {
                 rate.Units = 0;
                 rate.Cost = 0;
             }
+            RatePeriod mainRate = new RatePeriod() { Rate = Rate, Battery = MainRateBattery };
+            decimal BatteryCharge = 0;
+
             foreach (Data d in db.Query<Data>($@"SELECT *
 FROM Data
 WHERE Period >= {db.Quote(PeriodStart)}
 AND Period < {db.Quote(PeriodEnd)}
+ORDER BY Period
 ")) {
-                decimal time = d.Period.Hour + d.Period.Minute / 100;
+                decimal time = d.Period.Hour + d.Period.Minute / (decimal)100;
                 d.RateIndex = -1;
                 for (int i = 0; i < rates.Count; i++) {
                     RatePeriod rate = rates[i];
                     if (rate.Matches(time)) {
                         d.RateIndex = i;
-                        rate.Units += d.Value;
+                        updateRate(rate, ref d.Value, ref BatteryCharge);
                         break;
                     }
                 }
                 if (d.RateIndex == -1)
-                    PeakUsage += d.Value;
+                    updateRate(mainRate, ref d.Value, ref BatteryCharge);
                 if (d.Period < first)
                     first = d.Period.Date;
                 if (d.Period > last)
@@ -385,12 +413,17 @@ AND Period < {db.Quote(PeriodEnd)}
             }
             Days = (int)(PeriodEnd - PeriodStart).TotalDays;
             StandingCost = Days * StandingCharge / 100;
-            TotalUsage = PeakUsage;
+            MainRateUsage = mainRate.Units;
+            MainRateCost = mainRate.Cost;
+            MainRateBatteryChargedUnits = mainRate.BatteryChargedUnits;
+            MainRateBatteryUsedUnits = mainRate.BatteryUsedUnits;
+
+            TotalUsage = MainRateUsage;
             TotalCost = StandingCost;
             foreach (RatePeriod rate in rates) {
                 TotalUsage += rate.Units;
                 decimal shift = Math.Round(rate.ShiftWeeklyUnitsHere * Days / 7m, 0);
-                PeakUsage -= shift;
+                MainRateUsage -= shift;
                 rate.Units += shift;
                 rate.Cost = rate.Units * rate.Rate / 100;
                 TotalCost += rate.Cost;
@@ -398,16 +431,42 @@ AND Period < {db.Quote(PeriodEnd)}
             foreach (RatePeriod rate in rates) {
                 rate.Percentage = TotalUsage > 0 ? (decimal)rate.Units / (decimal)TotalUsage : 0;
             }
-            PeakCost = PeakUsage * Rate / 100;
-            PeakPercentage = TotalUsage > 0 ? (decimal)PeakUsage / (decimal)TotalUsage : 0;
-            TotalCost += PeakCost;
+            MainRateCost = MainRateUsage * Rate / 100;
+            MainRatePercentage = TotalUsage > 0 ? (decimal)MainRateUsage / (decimal)TotalUsage : 0;
+            TotalCost += MainRateCost;
             AnnualUsage = TotalUsage * 365 / Days;
             AnnualCost = TotalCost * 365 / Days;
             MonthlyCost = Math.Round(AnnualCost / 12, 2);
             Rates = rates;
         }
 
-    }
+        void updateRate(RatePeriod rate, ref decimal value, ref decimal BatteryCharge) {
+			if (BatteryStorage > 0) {
+				switch (rate.Battery) {
+					case BatteryUse.Charge:
+						decimal freeCapacity = BatteryStorage - BatteryCharge;
+						if (freeCapacity > 0) {
+							decimal amountToCharge = Math.Min(freeCapacity, MaxChargeRate / 2);
+							BatteryCharge += amountToCharge;
+							rate.BatteryChargedUnits += amountToCharge;
+							value += amountToCharge * 100 / Efficiency;
+						}
+						break;
+					case BatteryUse.Use:
+						decimal availableCapacity = Math.Min(BatteryStorage, MaxDischargeRate / 2);
+						if (availableCapacity > 0) {
+							decimal amountToUse = Math.Min(availableCapacity, value);
+							BatteryCharge -= amountToUse;
+							value -= amountToUse;
+							rate.BatteryUsedUnits += amountToUse;
+						}
+						break;
+				}
+			}
+			rate.Units += value;
+		}
+
+	}
 
     [Writeable]
     public class DownloadRequest : JsonObject {
@@ -436,6 +495,12 @@ AND Period < {db.Quote(PeriodEnd)}
         public int RateIndex;
     }
 
+    public enum BatteryUse {
+        None,
+        Charge,
+        Use
+    }
+
     public class RatePeriod : JsonObject {
         [Writeable]
         public decimal Start;
@@ -445,11 +510,17 @@ AND Period < {db.Quote(PeriodEnd)}
         public decimal Rate;
         [Writeable]
         public int ShiftWeeklyUnitsHere;
-        public decimal Units;
+		[Writeable]
+		public BatteryUse Battery = BatteryUse.Use;
+		public decimal Units;
         public decimal Cost;
         public decimal Percentage;
-        public bool Matches(decimal time) {
-            return Start < End ? time > Start && time <= End : Start > End  ? time > End || time <= Start : false;
+        public decimal BatteryChargedUnits;
+		public decimal BatteryUsedUnits;
+		public bool Matches(decimal time) {
+            return Start < End ? time > Start && time <= End :
+                Start > End  ? time > Start || time <= End 
+                : false;
         }
     }
 
