@@ -1,0 +1,24 @@
+<head>
+{{#if Form.Header.Pages}}
+<link{{NonceAttribute}} href="/multipageform{{VersionSuffix}}.css" rel="stylesheet" type="text/css" />
+{{/if}}
+	<script{{NonceAttribute}}>
+		$(function() {
+			makeMultiDetailForm('#headerform', '#detailform', {{Form.SafeOptions}});
+		});
+	</script>
+	<style{{NonceAttribute}}>
+		td.n, th.n, td.ni, th.ni {
+			text-align: right;
+		}
+	</style>
+</head>
+<body>
+<div class="form-body">
+<table id="headerform" cellspacing="0"></table>
+<h2>Rates</h2>
+<table id="detailform" border="1" cellspacing="0"></table>
+<h2>Summary</h2>
+<table id="detailform1" border="1" cellspacing="0"></table>
+</div>
+</body>

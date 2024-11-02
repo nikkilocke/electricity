@@ -41,7 +41,7 @@ namespace Electricity {
             return Database.Query("SELECT * FROM DataDisplay ORDER BY AnnualCost, Name");
         }
 
-        public HeaderDetailForm View(int id) {
+        public MultiDetailForm View(int id) {
             if (id > 0)
                 InsertMenuOptions(new MenuOption("Copy", "/home/view?dup=y&id=" + id));
             if (id <= 0 || !Database.TryGet(id, out DataDisplay display)) {
@@ -65,13 +65,16 @@ namespace Electricity {
                 display.idDataDisplay = null;
                 display.Name += " (copy)";
             }
-            HeaderDetailForm form = new HeaderDetailForm(this, typeof(DataDisplay), typeof(RatePeriod)) {
-                Data = new JObject().AddRange("header", display, "detail", display.Rates)
+            MultiDetailForm form = new MultiDetailForm(this, typeof(DataDisplay), new Type[] { typeof(RatePeriod), typeof(RatePeriod) }) {
+                Data = new JObject().AddRange("header", display, "detail", new List<RatePeriod>[] { display.Rates, display.Summary })
             };
-            form.CanDelete = display.idDataDisplay != null;
-			form.Detail.Options["addRows"] = true;
-            form.Detail.Options["deleteRows"] = true;
-            return form;
+            form.Details[1].Remove("Start", "End", "ShiftWeeklyUnitsHere", "Battery");
+			form.Details[1]["Rate"].Type = "decimal";
+			form.CanDelete = display.idDataDisplay != null;
+            form.Details[0].Options["addRows"] = true;
+            form.Details[0].Options["deleteRows"] = true;
+			form.Details[0].Options["sortable"] = true;
+			return form;
         }
 
         public AjaxReturn ViewSave(JObject json) {
@@ -81,7 +84,8 @@ namespace Electricity {
 				Utils.Check(header.MaxDischargeRate > 0, "Max Discharge Rate must be > 0");
 				Utils.Check(header.Efficiency > 0 && header.Efficiency <= 100, "Efficience must be > 0 and <= 100%");
             }
-            header.Rates = new List<RatePeriod>(json["detail"].To<List<RatePeriod>>()
+            JArray details = (JArray)json["detail"];
+			header.Rates = new List<RatePeriod>(details[0].To<List<RatePeriod>>()
                 .Where(rp => rp.Start != rp.End && rp.Rate != 0));
             header.Recalc(Database);
             AjaxReturn r = SaveRecord(header);
@@ -347,22 +351,28 @@ $"https://api.octopus.energy/v1/electricity-meter-points/{json.MeterMpan}/meters
                 RateData = value.ToJToken().ToString();
             }
         }
-        [ReadOnly]
+		[Field(Visible = false)]
+		[Length(0)]
+		public string SummaryData;
+		[DoNotStore]
+		[JsonIgnore]
+		public List<RatePeriod> Summary {
+			get {
+				if (string.IsNullOrWhiteSpace(SummaryData))
+					return new List<RatePeriod>();
+				else
+					return JArray.Parse(SummaryData).To<List<RatePeriod>>();
+			}
+			set {
+				SummaryData = value.ToJToken().ToString();
+			}
+		}
+		[ReadOnly]
         public int Days;
         [ReadOnly]
         public decimal TotalUsage;
-        [ReadOnly]
-        public decimal MainRateUsage;
-        [ReadOnly]
-        public decimal MainRatePercentage;
-		[ReadOnly]
-		public decimal MainRateBatteryChargedUnits;
-		[ReadOnly]
-		public decimal MainRateBatteryUsedUnits;
 		[ReadOnly]
         public decimal AnnualUsage;
-        [ReadOnly]
-        public decimal MainRateCost;
         [ReadOnly]
         public decimal StandingCost;
         [ReadOnly]
@@ -374,14 +384,15 @@ $"https://api.octopus.energy/v1/electricity-meter-points/{json.MeterMpan}/meters
 
         public void Recalc(Database db) {
             List<RatePeriod> rates = Rates;
-            MainRateUsage = 0;
             DateTime first = DateTime.MaxValue;
             DateTime last = DateTime.MinValue;
             foreach (RatePeriod rate in rates) {
                 rate.Units = 0;
                 rate.Cost = 0;
+                rate.BatteryChargedUnits = 0;
+                rate.BatteryUsedUnits = 0;
             }
-            RatePeriod mainRate = new RatePeriod() { Rate = Rate, Battery = MainRateBattery };
+            RatePeriod standardRate = new RatePeriod() { Rate = Rate, Battery = MainRateBattery };
             decimal BatteryCharge = 0;
 
             foreach (Data d in db.Query<Data>($@"SELECT *
@@ -401,7 +412,7 @@ ORDER BY Period
                     }
                 }
                 if (d.RateIndex == -1)
-                    updateRate(mainRate, ref d.Value, ref BatteryCharge);
+                    updateRate(standardRate, ref d.Value, ref BatteryCharge);
                 if (d.Period < first)
                     first = d.Period.Date;
                 if (d.Period > last)
@@ -413,55 +424,82 @@ ORDER BY Period
             }
             Days = (int)(PeriodEnd - PeriodStart).TotalDays;
             StandingCost = Days * StandingCharge / 100;
-            MainRateUsage = mainRate.Units;
-            MainRateCost = mainRate.Cost;
-            MainRateBatteryChargedUnits = mainRate.BatteryChargedUnits;
-            MainRateBatteryUsedUnits = mainRate.BatteryUsedUnits;
-
-            TotalUsage = MainRateUsage;
+            List<RatePeriod> summary = new List<RatePeriod> {
+				standardRate
+			};
+            TotalUsage = standardRate.Units;
             TotalCost = StandingCost;
             foreach (RatePeriod rate in rates) {
                 TotalUsage += rate.Units;
-                decimal shift = Math.Round(rate.ShiftWeeklyUnitsHere * Days / 7m, 0);
-                MainRateUsage -= shift;
+                decimal shift = Math.Min(Math.Round(rate.ShiftWeeklyUnitsHere * Days / 7m, 0), standardRate.Units);
+				standardRate.Units -= shift;
                 rate.Units += shift;
                 rate.Cost = rate.Units * rate.Rate / 100;
                 TotalCost += rate.Cost;
+                RatePeriod p = summary.FirstOrDefault(s => s.Rate == rate.Rate);
+                if(p == null) {
+                    p = new RatePeriod();
+                    p.CopyFrom(rate);
+                    summary.Add(p);
+                } else {
+                    p.Units += rate.Units;
+                    p.Cost += rate.Cost;
+                    p.BatteryChargedUnits += rate.BatteryChargedUnits;
+                    p.BatteryUsedUnits += rate.BatteryUsedUnits;
+                }
             }
-            foreach (RatePeriod rate in rates) {
+			standardRate.Cost = standardRate.Units * standardRate.Rate / 100;
+			TotalCost += standardRate.Cost;
+			foreach (RatePeriod rate in rates) {
                 rate.Percentage = TotalUsage > 0 ? (decimal)rate.Units / (decimal)TotalUsage : 0;
             }
-            MainRateCost = MainRateUsage * Rate / 100;
-            MainRatePercentage = TotalUsage > 0 ? (decimal)MainRateUsage / (decimal)TotalUsage : 0;
-            TotalCost += MainRateCost;
+			foreach (RatePeriod rate in summary) {
+				rate.Percentage = TotalUsage > 0 ? (decimal)rate.Units / (decimal)TotalUsage : 0;
+			}
             AnnualUsage = TotalUsage * 365 / Days;
             AnnualCost = TotalCost * 365 / Days;
             MonthlyCost = Math.Round(AnnualCost / 12, 2);
             Rates = rates;
+            Summary = summary;
         }
 
-        void updateRate(RatePeriod rate, ref decimal value, ref decimal BatteryCharge) {
+        void DebugRates(List<RatePeriod> rates, RatePeriod standardRate) {
+            List<RatePeriod> all = new List<RatePeriod>(rates);
+            all.Add(standardRate);
+            decimal total = 0;
+            foreach (RatePeriod rate in all) {
+				System.Diagnostics.Debug.WriteLine($"{rate.Rate} {rate.Battery} c={rate.BatteryChargedUnits} u={rate.BatteryUsedUnits}");
+                total += rate.BatteryChargedUnits - rate.BatteryUsedUnits;
+			}
+			System.Diagnostics.Debug.WriteLine($"t={total}");
+		}
+
+		void updateRate(RatePeriod rate, ref decimal value, ref decimal BatteryCharge) {
 			if (BatteryStorage > 0) {
 				switch (rate.Battery) {
 					case BatteryUse.Charge:
 						decimal freeCapacity = BatteryStorage - BatteryCharge;
 						if (freeCapacity > 0) {
 							decimal amountToCharge = Math.Min(freeCapacity, MaxChargeRate / 2);
+//                            System.Diagnostics.Debug.WriteLine($"{rate.Rate} charging {amountToCharge} from {BatteryCharge} capacity {freeCapacity}");
 							BatteryCharge += amountToCharge;
 							rate.BatteryChargedUnits += amountToCharge;
 							value += amountToCharge * 100 / Efficiency;
 						}
 						break;
 					case BatteryUse.Use:
-						decimal availableCapacity = Math.Min(BatteryStorage, MaxDischargeRate / 2);
+						decimal availableCapacity = Math.Min(BatteryCharge, MaxDischargeRate / 2);
 						if (availableCapacity > 0) {
 							decimal amountToUse = Math.Min(availableCapacity, value);
+//							System.Diagnostics.Debug.WriteLine($"{rate.Rate} using {amountToUse} from {BatteryCharge} capacity {availableCapacity}");
 							BatteryCharge -= amountToUse;
 							value -= amountToUse;
 							rate.BatteryUsedUnits += amountToUse;
 						}
 						break;
 				}
+                Utils.Check(BatteryCharge >= 0, "Battery charge negative");
+				Utils.Check(BatteryCharge <= BatteryStorage, "Battery overcharged");
 			}
 			rate.Units += value;
 		}
