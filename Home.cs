@@ -42,9 +42,7 @@ namespace Electricity {
         }
 
         public MultiDetailForm View(int id) {
-            if (id > 0)
-                InsertMenuOptions(new MenuOption("Copy", "/home/view?dup=y&id=" + id));
-            if (id <= 0 || !Database.TryGet(id, out DataDisplay display)) {
+			if (id <= 0 || !Database.TryGet(id, out DataDisplay display)) {
                 display = new DataDisplay() {
                     Rate = ((Settings)Settings).PeakRate,
                     StandingCharge = ((Settings)Settings).StandingCharge,
@@ -60,8 +58,11 @@ namespace Electricity {
                             Battery = BatteryUse.Charge
                         }
                     });
-            }
-            if (GetParameters["dup"] == "y") {
+            } else {
+				InsertMenuOptions(new MenuOption("Copy", "/home/view?dup=y&id=" + id));
+				InsertMenuOptions(new MenuOption("Data", $"/home/showdata?start={display.PeriodStart.ToString("yyyy-MM-dd")}&end={display.PeriodEnd.ToString("yyyy-MM-dd")}&{FromHere}"));
+			}
+			if (GetParameters["dup"] == "y") {
                 display.idDataDisplay = null;
                 display.Name += " (copy)";
             }
@@ -98,7 +99,20 @@ namespace Electricity {
             return DeleteRecord("DataDisplay", id);
         }
 
-        public Form Recalc() {
+        public DataTableForm ShowData(DateTime start, DateTime end) {
+            DataTableForm form = new DataTableForm(this, typeof(Data));
+            return form;
+        }
+
+        public JObjectEnumerable ShowDataListing(DateTime start, DateTime end) {
+            return Database.Query($@"SELECT * FROM Data 
+WHERE Period > {Database.Quote(start)}
+AND Period <= {Database.Quote(end.AddDays(1))}
+ORDER BY Period");
+        }
+
+
+		public Form Recalc() {
             return new Form(this, typeof(DataDisplay), true, "PeriodStart", "PeriodEnd") {
                 Data = new DataDisplay() {
                     PeriodStart = DateTime.Today.AddYears(-1),
@@ -134,7 +148,7 @@ namespace Electricity {
             // TODO: check if times are UTC or local, and adjust accordingly
             new BatchJob(this, "/home/list", delegate () {
                 Database.BeginTransaction();
-                int time = -1, units = -1;
+                int time = -1, units = -1, start = -1;
                 string[] data = UploadData.Content.Split('\n');
                 Batch.Records = data.Length;
                 foreach (string line in data) {
@@ -150,15 +164,19 @@ namespace Electricity {
                                 units = i;
                             else if (vals[i].Contains("time") || vals[i].Contains("End"))
                                 time = i;
-                        }
-                        Utils.Check(time >= 0, $"{Batch.Record}:Time of reading heading not found:'$line'");
+							else if (vals[i].Contains("Start"))
+								start = i;
+						}
+						Utils.Check(time >= 0, $"{Batch.Record}:Time of reading heading not found:'$line'");
                         Utils.Check(time >= 0 && units >= 0, $"{Batch.Record}:Consumption heading not found:'$line'");
                         continue;
                     }
                     Data d = new Data() {
                         Period = DateTime.Parse(vals[time].Replace("\"", "")),
-                        Value = Convert.ToDecimal(Double.Parse(vals[units].Replace("\"", "")))
+                        Value = Convert.ToDouble(Double.Parse(vals[units].Replace("\"", "")))
                     };
+                    d.Start = start >= 0 ? DateTime.Parse(vals[start].Replace("\"", "")) : d.Period.AddMinutes(-30);
+
                     Database.Update(d);
                 }
                 Database.Commit();
@@ -176,7 +194,9 @@ namespace Electricity {
             List<CheckResult> results = new List<CheckResult>();
             CheckResult current = null;
             foreach (Data d in Database.Query<Data>($@"SELECT * FROM Data ORDER BY Period")) {
-                if (current == null || d.Period > current.End.AddMinutes(30)) {
+                if (d.Start == DateTime.MinValue)
+                    d.Start = d.Period.AddMinutes(-30);
+                if (current == null || d.Start > current.End) {
                     current = new CheckResult() { Start = d.Period, End = d.Period };
                     results.Add(current);
                 } else {
@@ -233,7 +253,7 @@ namespace Electricity {
                         Batch.Record++;
                         Data d = new Data() {
                             Period = epoch.AddSeconds(line[0].ToObject<int>()),
-                            Value = line[1].ToObject<decimal>()
+                            Value = line[1].ToObject<double>()
                         };
                         Database.Update(d);
                     }
@@ -288,8 +308,9 @@ $"https://api.octopus.energy/v1/electricity-meter-points/{json.MeterMpan}/meters
 					foreach (JObject line in data) {
 						Batch.Record++;
                         Data d = new Data() {
-                            Period = line.AsDate("interval_start"),
-                            Value = line.AsDecimal("consumption")
+							Start = line.AsDate("interval_start"),
+							Period = line.AsDate("interval_end"),
+                            Value = line.AsDouble("consumption")
 						};
 						Database.Update(d);
 					}
@@ -397,8 +418,8 @@ $"https://api.octopus.energy/v1/electricity-meter-points/{json.MeterMpan}/meters
 
             foreach (Data d in db.Query<Data>($@"SELECT *
 FROM Data
-WHERE Period >= {db.Quote(PeriodStart)}
-AND Period < {db.Quote(PeriodEnd)}
+WHERE Period > {db.Quote(PeriodStart)}
+AND Period <= {db.Quote(PeriodEnd.AddDays(1))}
 ORDER BY Period
 ")) {
                 decimal time = d.Period.Hour + d.Period.Minute / (decimal)100;
@@ -416,25 +437,25 @@ ORDER BY Period
                 if (d.Period < first)
                     first = d.Period.Date;
                 if (d.Period > last)
-                    last = d.Period.Date.AddDays(1);
+                    last = d.Period.Date;
             }
             if (last != DateTime.MaxValue) {
-                PeriodStart = first;
-                PeriodEnd = last;
+                PeriodStart = first.Date;
+                PeriodEnd = last.AddSeconds(-1).Date;
             }
             Days = (int)(PeriodEnd - PeriodStart).TotalDays;
             StandingCost = Days * StandingCharge / 100;
             List<RatePeriod> summary = new List<RatePeriod> {
 				standardRate
 			};
-            TotalUsage = standardRate.Units;
+            double totalUsage = standardRate.Units;
             TotalCost = StandingCost;
             foreach (RatePeriod rate in rates) {
-                TotalUsage += rate.Units;
-                decimal shift = Math.Min(Math.Round(rate.ShiftWeeklyUnitsHere * Days / 7m, 0), standardRate.Units);
-				standardRate.Units -= shift;
-                rate.Units += shift;
-                rate.Cost = rate.Units * rate.Rate / 100;
+				totalUsage += rate.Units;
+                decimal shift = Math.Min(Math.Round(rate.ShiftWeeklyUnitsHere * Days / 7m, 0), (decimal)standardRate.Units);
+				standardRate.Units -= (double)shift;
+                rate.Units += (double)shift;
+                rate.Cost = (decimal)(rate.Units * (double)rate.Rate / 100);
                 TotalCost += rate.Cost;
                 RatePeriod p = summary.FirstOrDefault(s => s.Rate == rate.Rate);
                 if(p == null) {
@@ -448,7 +469,7 @@ ORDER BY Period
                     p.BatteryUsedUnits += rate.BatteryUsedUnits;
                 }
             }
-			standardRate.Cost = standardRate.Units * standardRate.Rate / 100;
+			standardRate.Cost = (decimal)standardRate.Units * standardRate.Rate / 100;
 			TotalCost += standardRate.Cost;
 			foreach (RatePeriod rate in rates) {
                 rate.Percentage = TotalUsage > 0 ? (decimal)rate.Units / (decimal)TotalUsage : 0;
@@ -456,7 +477,8 @@ ORDER BY Period
 			foreach (RatePeriod rate in summary) {
 				rate.Percentage = TotalUsage > 0 ? (decimal)rate.Units / (decimal)TotalUsage : 0;
 			}
-            AnnualUsage = TotalUsage * 365 / Days;
+			TotalUsage = (decimal)totalUsage;
+			AnnualUsage = TotalUsage * 365 / Days;
             AnnualCost = TotalCost * 365 / Days;
             MonthlyCost = Math.Round(AnnualCost / 12, 2);
             Rates = rates;
@@ -474,7 +496,7 @@ ORDER BY Period
 			System.Diagnostics.Debug.WriteLine($"t={total}");
 		}
 
-		void updateRate(RatePeriod rate, ref decimal value, ref decimal BatteryCharge) {
+		void updateRate(RatePeriod rate, ref double value, ref decimal BatteryCharge) {
 			if (BatteryStorage > 0) {
 				switch (rate.Battery) {
 					case BatteryUse.Charge:
@@ -484,16 +506,16 @@ ORDER BY Period
 //                            System.Diagnostics.Debug.WriteLine($"{rate.Rate} charging {amountToCharge} from {BatteryCharge} capacity {freeCapacity}");
 							BatteryCharge += amountToCharge;
 							rate.BatteryChargedUnits += amountToCharge;
-							value += amountToCharge * 100 / Efficiency;
+							value += (double)(amountToCharge * 100 / Efficiency);
 						}
 						break;
 					case BatteryUse.Use:
 						decimal availableCapacity = Math.Min(BatteryCharge, MaxDischargeRate / 2);
 						if (availableCapacity > 0) {
-							decimal amountToUse = Math.Min(availableCapacity, value);
+							decimal amountToUse = Math.Min(availableCapacity, (decimal)value);
 //							System.Diagnostics.Debug.WriteLine($"{rate.Rate} using {amountToUse} from {BatteryCharge} capacity {availableCapacity}");
 							BatteryCharge -= amountToUse;
-							value -= amountToUse;
+							value -= (double)amountToUse;
 							rate.BatteryUsedUnits += amountToUse;
 						}
 						break;
@@ -526,9 +548,12 @@ ORDER BY Period
 
 	[Table]
     public class Data : JsonObject {
-        [Primary(AutoIncrement = false)]
+		[Field(Type = "dateTime")]
+		public DateTime Start;
+		[Primary(AutoIncrement = false)]
+		[Field(Type="dateTime")]
         public DateTime Period;
-        public decimal Value;
+		public double Value;
         [DoNotStore]
         public int RateIndex;
     }
@@ -550,7 +575,7 @@ ORDER BY Period
         public int ShiftWeeklyUnitsHere;
 		[Writeable]
 		public BatteryUse Battery = BatteryUse.Use;
-		public decimal Units;
+		public double Units;
         public decimal Cost;
         public decimal Percentage;
         public decimal BatteryChargedUnits;

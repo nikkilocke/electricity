@@ -6,10 +6,14 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <None Remove="Electricity\default.inc" />
     <None Remove="Electricity\home\view.tmpl" />
   </ItemGroup>
 
   <ItemGroup>
+    <Content Include="Electricity\default.inc">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
     <Content Include="Electricity\home\view.tmpl">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
